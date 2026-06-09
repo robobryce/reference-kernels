@@ -12,7 +12,6 @@ sort_cuda_source = """
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <cub/device/device_radix_sort.cuh>
-#include <cuda_runtime.h>
 #include <cstdint>
 
 static torch::Tensor persistent_temp = {};
@@ -37,18 +36,13 @@ torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output) {
     auto num_items = static_cast<int32_t>(input.numel());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
-    int32_t* key_buf = reinterpret_cast<int32_t*>(output.data_ptr<float>());
-
-    // Copy input to output, then sort in-place
-    // This eliminates separate input/output buffer management for the sort kernel,
-    // potentially reducing memory pressure and letting CUB optimize the data path.
-    cudaMemcpyAsync(key_buf, input.const_data_ptr<float>(),
-                    num_items * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+    const int32_t* key_in = reinterpret_cast<const int32_t*>(input.const_data_ptr<float>());
+    int32_t* key_out = reinterpret_cast<int32_t*>(output.data_ptr<float>());
 
     size_t temp_bytes = persistent_temp_bytes;
     cub::DeviceRadixSort::SortKeys(
         persistent_temp.data_ptr(), temp_bytes,
-        key_buf, key_buf, num_items,
+        key_in, key_out, num_items,
         0, 32,
         stream);
 
@@ -64,7 +58,7 @@ torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output);
 """
 
 sort_module = load_inline(
-    name='sort_cuda_inplace_sm100a',
+    name='sort_cuda_int32_offsets_sm100a',
     cpp_sources=sort_cpp_source,
     cuda_sources=sort_cuda_source,
     functions=['sort_cuda', 'init_persistent_temp'],
