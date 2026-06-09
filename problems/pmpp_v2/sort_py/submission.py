@@ -16,62 +16,17 @@ cuda_source = r"""
 #include <cmath>
 
 // ---------------------------------------------------------------------------
-// Phase 1: per-row BlockRadixSort in shared memory
-// 256 threads x 40 items = 10240 capacity (covers 100M's ~10K-item rows)
+// Phase 1: per-row segmented radix sort via cub::DeviceSegmentedRadixSort
+// Each row is a segment; CUB sorts all rows independently in one batched call.
 // ---------------------------------------------------------------------------
-constexpr int ROW_BLOCK_THREADS = 256;
-constexpr int ROW_ITEMS_PER_THREAD = 40;
-
-template <int BLOCK_DIM, int IPT>
-__global__ void sort_rows_kernel(
-    float*       data,
-    const int*   row_offsets,
-    int          rows,
-    int          max_cols)
-{
-    int row = blockIdx.x;
-    if (row >= rows) return;
-
-    int start = row_offsets[row];
-    int end   = row_offsets[row + 1];
-    int count = end - start;
-
-    using BlockRS = cub::BlockRadixSort<float, BLOCK_DIM, IPT>;
-    __shared__ typename BlockRS::TempStorage temp_storage;
-
-    // Per-thread register arrays — BlockRadixSort::Sort operates on these
-    float thread_keys[IPT];
-
-    float* row_data = data + start;
-
-    // Load keys into per-thread arrays (pad tail with INFINITY)
-    #pragma unroll
-    for (int i = 0; i < IPT; i++) {
-        int idx = threadIdx.x * IPT + i;
-        thread_keys[i] = (idx < count) ? row_data[idx] : INFINITY;
-    }
-    __syncthreads();
-
-    // Radix sort the per-thread keys (in registers, using shared temp storage)
-    BlockRS(temp_storage).Sort(thread_keys);
-    __syncthreads();
-
-    // Write back (excluding padding)
-    #pragma unroll
-    for (int i = 0; i < IPT; i++) {
-        int idx = threadIdx.x * IPT + i;
-        if (idx < count) {
-            row_data[idx] = thread_keys[i];
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Phase 2: batched merge kernel — 2D grid (chunks_per_pair, num_pairs)
-// Each block handles one chunk of one pair's output.
+// Each block handles one chunk (MERGE_ITEMS_PER_BLOCK items) of one pair.
+// Threads binary-search independently on the merge path, then serially merge.
 // ---------------------------------------------------------------------------
 constexpr int MERGE_BLOCK_THREADS = 256;
-constexpr int MERGE_ITEMS_PER_BLOCK = 1536;  // 6 items/thread
+constexpr int MERGE_ITEMS_PER_BLOCK = 2048;  // 8 items/thread
 
 __global__ void merge_level_kernel(
     const float* src,
@@ -97,7 +52,7 @@ __global__ void merge_level_kernel(
     int block_len = min(MERGE_ITEMS_PER_BLOCK, total_len - block_start);
 
     int tid = threadIdx.x;
-    int items_per_thread = MERGE_ITEMS_PER_BLOCK / MERGE_BLOCK_THREADS;
+    int items_per_thread = MERGE_ITEMS_PER_BLOCK / MERGE_BLOCK_THREADS;  // 8
 
     int t_start = block_start + tid * items_per_thread;
     int t_end   = min(t_start + items_per_thread, block_start + block_len);
@@ -128,7 +83,6 @@ __global__ void merge_level_kernel(
     int b_end_ptr = b_start + lenB;
 
     float* out = dst + dst_start + t_start;
-    #pragma unroll 1
     for (int i = 0; i < t_len; i++) {
         if (posA < a_end_ptr && (posB >= b_end_ptr || src[posA] <= src[posB])) {
             out[i] = src[posA++];
@@ -139,7 +93,7 @@ __global__ void merge_level_kernel(
 }
 
 // ---------------------------------------------------------------------------
-// Simple copy kernel (for odd leftover segments)
+// Copy kernel (for odd leftover segments)
 // ---------------------------------------------------------------------------
 __global__ void copy_segment_kernel(const float* src, float* dst, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -147,7 +101,7 @@ __global__ void copy_segment_kernel(const float* src, float* dst, int n) {
 }
 
 // ---------------------------------------------------------------------------
-// Host-side segment layout builder
+// Host-side segment layout
 // ---------------------------------------------------------------------------
 struct SegLayout {
     std::vector<int> starts;
@@ -164,13 +118,11 @@ static SegLayout build_initial_layout(const int* row_offsets, int rows) {
     return layout;
 }
 
-// Build the next level's layout from current level.
-// Returns false when only one segment remains (fully sorted).
 static bool next_merge_level(
     const SegLayout& cur,
     SegLayout&       next,
-    std::vector<int>& pair_info,     // [num_pairs*4] for merge kernel
-    std::vector<int>& dst_offsets,    // [num_pairs]
+    std::vector<int>& pair_info,
+    std::vector<int>& dst_offsets,
     int&              max_chunks)
 {
     int n = (int)cur.lengths.size();
@@ -206,7 +158,7 @@ static bool next_merge_level(
         if (chunks > max_chunks) max_chunks = chunks;
     }
 
-    // Odd leftover
+    // Odd leftover segment — pass through unsorted
     if (n % 2 == 1) {
         int last_start = cur.starts[n - 1];
         int last_len   = cur.lengths[n - 1];
@@ -215,7 +167,7 @@ static bool next_merge_level(
         pos += last_len;
     }
 
-    next.starts.push_back(pos);  // sentinel
+    next.starts.push_back(pos);
     return true;
 }
 
@@ -232,7 +184,6 @@ torch::Tensor segment_sort(torch::Tensor input, torch::Tensor output) {
     if (N == 0) return output;
     if (N == 1) { output[0] = input[0]; return output; }
 
-    // --- row dimensions ---
     int rows = (int)std::sqrt((double)N);
     int cols = (N + rows - 1) / rows;
 
@@ -241,28 +192,60 @@ torch::Tensor segment_sort(torch::Tensor input, torch::Tensor output) {
     for (int i = 0; i < rows; i++) row_offsets[i] = i * cols;
     row_offsets[rows] = N;
 
-    // --- Phase 1: per-row BlockRadixSort ---
+    // --- Phase 1: per-row segmented radix sort ---
+    // DeviceSegmentedRadixSort::SortKeys sorts each segment independently
+    // d_begin_offsets[i] = start of segment i, d_end_offsets[i] = end of segment i
     {
-        int* d_row_offsets;
-        cudaMalloc(&d_row_offsets, (rows + 1) * sizeof(int));
-        cudaMemcpy(d_row_offsets, row_offsets.data(), (rows + 1) * sizeof(int),
-                   cudaMemcpyHostToDevice);
+        // Build begin/end offset arrays
+        std::vector<int> h_begin_offsets(rows);
+        std::vector<int> h_end_offsets(rows);
+        for (int i = 0; i < rows; i++) {
+            h_begin_offsets[i] = row_offsets[i];
+            h_end_offsets[i]   = row_offsets[i + 1];
+        }
 
-        sort_rows_kernel<ROW_BLOCK_THREADS, ROW_ITEMS_PER_THREAD>
-            <<<rows, ROW_BLOCK_THREADS>>>(
-                input.data_ptr<float>(), d_row_offsets, rows, cols);
+        int* d_begin_offsets;
+        int* d_end_offsets;
+        cudaMalloc(&d_begin_offsets, rows * sizeof(int));
+        cudaMalloc(&d_end_offsets,   rows * sizeof(int));
+        cudaMemcpy(d_begin_offsets, h_begin_offsets.data(),
+                   rows * sizeof(int), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_end_offsets,   h_end_offsets.data(),
+                   rows * sizeof(int), cudaMemcpyHostToDevice);
+
+        // Query temp storage
+        void*  d_temp = nullptr;
+        size_t temp_bytes = 0;
+        cub::DeviceSegmentedRadixSort::SortKeys(
+            nullptr, temp_bytes,
+            input.data_ptr<float>(),  // keys in
+            input.data_ptr<float>(),  // keys out (in-place sort)
+            N, rows,
+            d_begin_offsets, d_end_offsets,
+            0, sizeof(float) * 8);
+
+        cudaMalloc(&d_temp, temp_bytes);
+        cub::DeviceSegmentedRadixSort::SortKeys(
+            d_temp, temp_bytes,
+            input.data_ptr<float>(),
+            input.data_ptr<float>(),
+            N, rows,
+            d_begin_offsets, d_end_offsets,
+            0, sizeof(float) * 8);
 
         cudaDeviceSynchronize();
-        cudaFree(d_row_offsets);
+        cudaFree(d_temp);
+        cudaFree(d_begin_offsets);
+        cudaFree(d_end_offsets);
     }
 
     // --- Phase 2: multi-level merge tree ---
     SegLayout cur = build_initial_layout(row_offsets.data(), rows);
 
     float* bufs[2] = { input.data_ptr<float>(), output.data_ptr<float>() };
-    int which = 0;  // current source buffer
-
+    int which = 0;
     int level = 0;
+
     while (true) {
         SegLayout next;
         std::vector<int> pair_info;
@@ -276,20 +259,20 @@ torch::Tensor segment_sort(torch::Tensor input, torch::Tensor output) {
         float* dst_buf = bufs[1 - which];
 
         int num_pairs = (int)dst_offsets.size();
+
         if (num_pairs == 0) {
-            // only one segment — just copy it
+            // Only one segment — copy it to dst
             int seg_len = cur.lengths[0];
-            int seg_start = cur.starts[0];
             int blocks = (seg_len + 255) / 256;
             copy_segment_kernel<<<blocks, 256>>>(
-                src_buf + seg_start, dst_buf, seg_len);
+                src_buf + cur.starts[0], dst_buf, seg_len);
             cudaDeviceSynchronize();
             which = 1 - which;
             cur = next;
             continue;
         }
 
-        // Upload pair info and dst offsets to GPU
+        // Upload pair info
         int* d_pair_info;
         int* d_dst_offsets;
         cudaMalloc(&d_pair_info, pair_info.size() * sizeof(int));
@@ -307,7 +290,7 @@ torch::Tensor segment_sort(torch::Tensor input, torch::Tensor output) {
         cudaFree(d_pair_info);
         cudaFree(d_dst_offsets);
 
-        // Copy odd leftover segment if present
+        // Copy odd leftover segment
         int n = (int)cur.lengths.size();
         if (n % 2 == 1 && n > 1) {
             int last_start = cur.starts[n - 1];
@@ -327,7 +310,7 @@ torch::Tensor segment_sort(torch::Tensor input, torch::Tensor output) {
 
     cudaDeviceSynchronize();
 
-    // If final result is in input buffer (odd number of flips), copy to output
+    // Final copy if result landed in input buffer
     if (level % 2 == 1) {
         int blocks = (N + 255) / 256;
         copy_segment_kernel<<<blocks, 256>>>(
@@ -351,9 +334,10 @@ segment_module = load_inline(
 
 def custom_kernel(data: input_t) -> output_t:
     """
-    Segmented sort: per-row BlockRadixSort (shared memory) then multi-level
-    batched merge tree. Exploits the per-row-normal input: each row clusters
-    around an increasing mean, so cross-row merges scan less overlap.
+    Segmented sort: Phase 1 = cub::DeviceSegmentedRadixSort per row,
+    Phase 2 = batched multi-level merge tree with merge-path parallel merge.
+    Exploits the per-row-normal input structure: rows are centered at
+    increasing means, so higher-level merges encounter minimal cross-row overlap.
     """
     input_tensor, output_tensor = data
     segment_module.segment_sort(input_tensor, output_tensor)
