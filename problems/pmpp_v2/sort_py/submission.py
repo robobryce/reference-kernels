@@ -24,10 +24,10 @@ torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output) {
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
-    // Use thrust::sort with device execution policy on raw pointers
-    // thrust::sort on GPU uses merge sort, operating directly on float32
+    // Use thrust::stable_sort with device execution policy on raw pointers
+    // thrust::stable_sort on GPU uses merge sort, operating directly on float32
     auto policy = thrust::cuda::par.on(stream);
-    thrust::sort(policy,
+    thrust::stable_sort(policy,
                  output.data_ptr<float>(),
                  output.data_ptr<float>() + num_items);
 
@@ -42,7 +42,7 @@ torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output);
 """
 
 sort_module = load_inline(
-    name='sort_cuda_thrust',
+    name='sort_cuda_thrust_stable',
     cpp_sources=sort_cpp_source,
     cuda_sources=sort_cuda_source,
     functions=['sort_cuda'],
