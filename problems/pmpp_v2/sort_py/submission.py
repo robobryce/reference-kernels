@@ -1,7 +1,8 @@
 """
-In-place CUB DeviceRadixSort::SortKeys — copy input to output buffer,
-then sort output in-place (aliasing: same pointer for in/out keys).
-Persistent temp storage allocated once at module init.
+In-place sort via cub::DoubleBuffer — wraps output tensor's data_ptr
+and a temp buffer to manage input/output swap during SortKeys.
+Copy input to DoubleBuffer's current slot, sort swaps to alternate,
+then copy back if needed. Persistent temp storage + DoubleBuffer.
 """
 import torch
 from torch.utils.cpp_extension import load_inline
@@ -14,6 +15,7 @@ sort_cuda_source = """
 #include <cstdint>
 
 static torch::Tensor persistent_temp = {};
+static torch::Tensor persistent_dbl_buffer = {};
 static size_t persistent_temp_bytes = 0;
 
 void init_persistent_temp() {
@@ -29,6 +31,9 @@ void init_persistent_temp() {
     persistent_temp = torch::empty(
         {static_cast<int64_t>(persistent_temp_bytes)},
         torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA));
+    persistent_dbl_buffer = torch::empty(
+        {max_n},
+        torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
 }
 
 torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output) {
@@ -41,21 +46,30 @@ torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output) {
     auto num_items = static_cast<int64_t>(input.numel());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
-    // Copy input to output first (D2D memcpy)
+    // Copy input to output first (we sort the output buffer in-place)
     cudaMemcpyAsync(
         output.data_ptr<float>(), input.const_data_ptr<float>(),
         num_items * sizeof(float), cudaMemcpyDeviceToDevice, stream);
 
-    // Now sort output in-place: same pointer for input and output keys.
-    // CUB SortKeys reads from d_in_keys and writes to d_out_keys.
-    // If they alias, the sort is effectively in-place on the output buffer.
-    int32_t* keys = reinterpret_cast<int32_t*>(output.data_ptr<float>());
+    // DoubleBuffer: current=output buffer, alternate=temp dbl buffer
+    int32_t* dbl_buf = reinterpret_cast<int32_t*>(persistent_dbl_buffer.data_ptr());
+    int32_t* out_keys = reinterpret_cast<int32_t*>(output.data_ptr<float>());
+
+    cub::DoubleBuffer<int32_t> d_keys(out_keys, dbl_buf);
+
     size_t temp_bytes = persistent_temp_bytes;
     cub::DeviceRadixSort::SortKeys(
         persistent_temp.data_ptr(), temp_bytes,
-        keys, keys, num_items,
+        d_keys, num_items,
         0, 32,
         stream);
+
+    // If result is in dbl_buf (alternate), copy back to output
+    if (d_keys.Current() != out_keys) {
+        cudaMemcpyAsync(
+            output.data_ptr<float>(), dbl_buf,
+            num_items * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+    }
 
     return output;
 }
@@ -69,7 +83,7 @@ torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output);
 """
 
 sort_module = load_inline(
-    name='sort_cuda_inplace_alias',
+    name='sort_cuda_doublebuffer',
     cpp_sources=sort_cpp_source,
     cuda_sources=sort_cuda_source,
     functions=['sort_cuda', 'init_persistent_temp'],
