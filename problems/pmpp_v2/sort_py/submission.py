@@ -11,6 +11,6 @@ def custom_kernel(data: input_t) -> output_t:
         Sorted tensor
     """
     data, output = data
-    output[...] = torch.sort(data, stable=True)[0]
+    output[...] = torch.sort(data)[0]
     torch.cuda.synchronize()
     return output
