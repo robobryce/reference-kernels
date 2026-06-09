@@ -1,12 +1,15 @@
 """
-Sample Sort: partition into 128 value-range buckets using quantile-based splitters,
-then sort each bucket independently with CUB DeviceRadixSort::SortKeys.
+Sample Sort with DeviceSegmentedRadixSort: partition into 128 value-range buckets
+using quantile-based splitters, scatter, then sort all buckets in one fused
+DeviceSegmentedRadixSort call instead of 128 individual SortKeys.
 
-Algorithm per call:
-  1. Build global histogram (block-local shared mem, reduce to global via atomicAdd)
-  2. Copy tiny 128-entry histogram to host, exclusive scan, upload offsets
-  3. Scatter: grid-stride with atomicAdd on per-bucket counters for unique positions
-  4. Sort each non-empty bucket with CUB SortKeys (scatter_buf -> output in place)
+Algorithm:
+  1. Sample 1024 elements, sort on host, pick 127 quantile splitters
+  2. Build global histogram (block-local shared mem, reduce to global via atomicAdd)
+  3. Host-side exclusive scan on histogram -> per-bucket segment offsets
+  4. Scatter: grid-stride atomicAdd on per-bucket counters -> scatter_buf
+  5. Single DeviceSegmentedRadixSort::SortKeys sorts all segments in one fused op
+  6. No per-bucket host round-trips or individual kernel launches
 """
 import torch
 from torch.utils.cpp_extension import load_inline
@@ -15,7 +18,7 @@ from task import input_t, output_t
 sort_cuda_source = r"""
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
-#include <cub/device/device_radix_sort.cuh>
+#include <cub/device/device_segmented_radix_sort.cuh>
 #include <cuda/std/functional>
 #include <cstdint>
 #include <cstring>
@@ -25,16 +28,18 @@ constexpr int NUM_SPLITTERS = NUM_BUCKETS - 1;
 constexpr int BLOCK_SIZE = 256;
 constexpr int ITEMS_PER_BLOCK = 1024;
 
-// Persistent CUB temp storage (sized for max bucket)
+// Persistent CUB temp storage sized for full N (SegmentedRadixSort)
 static torch::Tensor persistent_temp = {};
 static size_t persistent_temp_bytes = 0;
 
 void init_persistent_temp() {
     if (persistent_temp.defined()) return;
     size_t bytes = 0;
-    cub::DeviceRadixSort::SortKeys(nullptr, bytes,
+    cub::DeviceSegmentedRadixSort::SortKeys(nullptr, bytes,
         static_cast<const int32_t*>(nullptr), static_cast<int32_t*>(nullptr),
-        static_cast<int64_t>(1'000'000),  // 1M per bucket max
+        static_cast<int64_t>(100'000'000),
+        128,  // max segments
+        static_cast<const int32_t*>(nullptr), static_cast<const int32_t*>(nullptr),
         0, 32);
     persistent_temp_bytes = (bytes * 11 + 9) / 10;
     persistent_temp = torch::empty(
@@ -53,7 +58,6 @@ __device__ __forceinline__ int find_bucket(
     return bucket;
 }
 
-// Block-local histogram -> atomicAdd to global (minimizes global atomics).
 __global__ void histogram_kernel(
     const int32_t* __restrict__ keys,
     const float* __restrict__ splitters,
@@ -80,12 +84,11 @@ __global__ void histogram_kernel(
     }
 }
 
-// Scatter: atomic increment per-bucket counter for unique destination.
 __global__ void scatter_kernel(
     const int32_t* __restrict__ keys,
     const float* __restrict__ splitters,
     int32_t* __restrict__ scatter_buf,
-    int* __restrict__ counters,  // [NUM_BUCKETS+1], init'd to offsets[0..N]
+    int* __restrict__ counters,
     int num_elements)
 {
     int tid = threadIdx.x;
@@ -105,7 +108,9 @@ torch::Tensor sort_cuda(
     torch::Tensor splitters_tensor,
     torch::Tensor histogram,
     torch::Tensor bucket_offsets,
-    torch::Tensor scatter_buf)
+    torch::Tensor scatter_buf,
+    torch::Tensor seg_begin,
+    torch::Tensor seg_end)
 {
     int64_t N = input.numel();
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
@@ -117,11 +122,16 @@ torch::Tensor sort_cuda(
     int*           d_offsets   = bucket_offsets.data_ptr<int>();
     int32_t*       d_scatter   = scatter_buf.data_ptr<int32_t>();
 
-    // ---- small-N fast path ----
     if (N <= static_cast<int64_t>(NUM_BUCKETS * 32)) {
-        size_t temp_bytes = persistent_temp_bytes;
-        cub::DeviceRadixSort::SortKeys(
-            persistent_temp.data_ptr(), temp_bytes,
+        // Fallback to simple SortKeys for tiny N
+        size_t bytes = 0;
+        cub::DeviceRadixSort::SortKeys(nullptr, bytes,
+            static_cast<const int32_t*>(nullptr), static_cast<int32_t*>(nullptr),
+            static_cast<int64_t>(N), 0, 32);
+        bytes = (bytes * 11 + 9) / 10;
+        auto temp = torch::empty({static_cast<int64_t>(bytes)},
+            torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA));
+        cub::DeviceRadixSort::SortKeys(temp.data_ptr(), bytes,
             key_in, key_out, N, 0, 32, stream);
         cudaStreamSynchronize(stream);
         return output;
@@ -131,13 +141,12 @@ torch::Tensor sort_cuda(
         (static_cast<int>(N) + ITEMS_PER_BLOCK - 1) / ITEMS_PER_BLOCK,
         65535);
 
-    // ========== Step 1: Histogram ==========
+    // ====== Step 1: Histogram ======
     cudaMemsetAsync(d_histogram, 0, NUM_BUCKETS * sizeof(int), stream);
     histogram_kernel<<<num_blocks, BLOCK_SIZE, NUM_BUCKETS * sizeof(int), stream>>>(
         key_in, d_splitters, d_histogram, static_cast<int>(N));
 
-    // ========== Step 2: Host-side exclusive scan ==========
-    // Synchronous cudaMemcpy acts as a barrier for the histogram kernel.
+    // ====== Step 2: Host-side exclusive scan ======
     int h_hist[NUM_BUCKETS];
     cudaMemcpy(h_hist, d_histogram, NUM_BUCKETS * sizeof(int), cudaMemcpyDeviceToHost);
 
@@ -147,40 +156,49 @@ torch::Tensor sort_cuda(
         h_offsets[b + 1] = h_offsets[b] + h_hist[b];
     }
 
+    // Count non-empty buckets for segment array sizing
+    int num_segs = 0;
+    int h_begin[NUM_BUCKETS], h_end[NUM_BUCKETS];
+    for (int b = 0; b < NUM_BUCKETS; b++) {
+        if (h_hist[b] > 0) {
+            h_begin[num_segs] = h_offsets[b];
+            h_end[num_segs]   = h_offsets[b + 1];
+            num_segs++;
+        }
+    }
+
+    // ====== Step 3: Scatter ======
+    // Upload offsets as initial counter values
     cudaMemcpyAsync(d_offsets, h_offsets, (NUM_BUCKETS + 1) * sizeof(int),
                     cudaMemcpyHostToDevice, stream);
-
-    // ========== Step 3: Scatter ==========
-    // Copy offsets to writable counters; the last entry (total=N) is our guard.
-    cudaMemcpyAsync(reinterpret_cast<void*>(d_offsets), h_offsets,
-                    (NUM_BUCKETS + 1) * sizeof(int), cudaMemcpyHostToDevice, stream);
-    // We reuse d_offsets as the mutable counter array; we already uploaded h_offsets.
-    // The scatter kernel writes counters[b] past h_offsets[b] because of atomicAdd.
-    // After scatter: counters[b] == h_offsets[b+1] (start of next bucket).
     scatter_kernel<<<num_blocks, BLOCK_SIZE, 0, stream>>>(
-        key_in, d_splitters, d_scatter,
-        d_offsets,  // in-place: init'd to starts, atomically incremented
+        key_in, d_splitters, d_scatter, d_offsets,
         static_cast<int>(N));
 
-    // ========== Step 4: Per-bucket sorts ==========
-    // We need bucket sizes.  Read the post-scatter counters back.
+    // ====== Step 4: Segmented sort all buckets in one call ======
+    // Upload segment boundaries
+    cudaMemcpyAsync(seg_begin.data_ptr(), h_begin, num_segs * sizeof(int),
+                    cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(seg_end.data_ptr(), h_end, num_segs * sizeof(int),
+                    cudaMemcpyHostToDevice, stream);
+
+    // Wait for scatter + segment uploads
     cudaStreamSynchronize(stream);
-    int h_counters[NUM_BUCKETS + 1];
-    cudaMemcpy(h_counters, d_offsets, (NUM_BUCKETS + 1) * sizeof(int),
-               cudaMemcpyDeviceToHost);
 
-    for (int b = 0; b < NUM_BUCKETS; b++) {
-        int bsize = h_counters[b] - h_offsets[b];
-        if (bsize <= 0) continue;
+    const int32_t* d_begin = seg_begin.data_ptr<int32_t>();
+    const int32_t* d_end   = seg_end.data_ptr<int32_t>();
 
-        int32_t* src = d_scatter + h_offsets[b];
-        int32_t* dst = key_out   + h_offsets[b];
+    size_t temp_bytes = persistent_temp_bytes;
+    cudaError_t err = cub::DeviceSegmentedRadixSort::SortKeys(
+        persistent_temp.data_ptr(), temp_bytes,
+        d_scatter, key_out,
+        static_cast<int>(N),
+        num_segs,
+        d_begin, d_end,
+        0, 32, stream);
 
-        size_t temp_bytes = persistent_temp_bytes;
-        cub::DeviceRadixSort::SortKeys(
-            persistent_temp.data_ptr(), temp_bytes,
-            src, dst, static_cast<int64_t>(bsize),
-            0, 32, stream);
+    if (err != cudaSuccess) {
+        printf("CUB SegmentedRadixSort failed: %s\n", cudaGetErrorString(err));
     }
 
     cudaStreamSynchronize(stream);
@@ -196,11 +214,13 @@ torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output,
                         torch::Tensor splitters,
                         torch::Tensor histogram,
                         torch::Tensor bucket_offsets,
-                        torch::Tensor scatter_buf);
+                        torch::Tensor scatter_buf,
+                        torch::Tensor seg_begin,
+                        torch::Tensor seg_end);
 """
 
 sort_module = load_inline(
-    name='sort_cuda_sample_sort_v1',
+    name='sort_cuda_sample_sort_v2',
     cpp_sources=sort_cpp_source,
     cuda_sources=sort_cuda_source,
     functions=['sort_cuda', 'init_persistent_temp'],
@@ -214,13 +234,13 @@ sort_module.init_persistent_temp()
 def custom_kernel(data: input_t) -> output_t:
     """
     Sample Sort: partition via quantile splitters into 128 buckets,
-    scatter, then sort each bucket independently with CUB SortKeys.
+    scatter, then single DeviceSegmentedRadixSort sorts all buckets at once.
     """
     input_tensor, output_tensor = data
     input_tensor = input_tensor.contiguous()
     N = int(input_tensor.numel())
 
-    # ---- Sample + splitters on host ----
+    # Sample + splitters on host
     sample_size = min(1024, max(128, N // 4))
     sample_idx = torch.randint(0, N, (sample_size,))
     sample_vals = input_tensor.flatten()[sample_idx].cpu().numpy()
@@ -232,13 +252,16 @@ def custom_kernel(data: input_t) -> output_t:
     ]
     splitters_tensor = torch.tensor(splitters, dtype=torch.float32, device='cuda')
 
-    # ---- GPU buffers ----
+    # GPU buffers
     histogram = torch.zeros(128, dtype=torch.int32, device='cuda')
     bucket_offsets = torch.empty(129, dtype=torch.int32, device='cuda')
     scatter_buf = torch.empty(N, dtype=torch.int32, device='cuda')
+    seg_begin = torch.empty(128, dtype=torch.int32, device='cuda')
+    seg_end = torch.empty(128, dtype=torch.int32, device='cuda')
 
     sort_module.sort_cuda(
         input_tensor, output_tensor,
         splitters_tensor, histogram, bucket_offsets, scatter_buf,
+        seg_begin, seg_end,
     )
     return output_tensor
