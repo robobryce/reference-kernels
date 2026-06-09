@@ -5,85 +5,99 @@ from task import input_t, output_t
 
 
 @triton.jit
-def bitonic_sort_kernel(
+def bitonic_merge_stride(
     data_ptr,
-    n_elements,       # padded_n — inf sentinels must participate
+    n_elements,
     stage_size,
     stride,
     BLOCK_SIZE: tl.constexpr,
 ):
     """
-    Bitonic merge kernel. Thread 'idx' compares element at 'idx' with
-    'idx ^ stride'. Controller thread (idx < partner) performs both
-    writes; non-controller threads do nothing.
+    Single-stride bitonic merge. Controller writes both positions.
+    Used for inter-block strides.
     """
     pid = tl.program_id(0)
     tid = tl.arange(0, BLOCK_SIZE)
-
     idx = pid * BLOCK_SIZE + tid
     partner = idx ^ stride
+    c = idx < partner
+    io = idx < n_elements
+    po = partner < n_elements
+    asc = (idx & stage_size) == 0
+    v = tl.load(data_ptr + idx, mask=io, other=float('inf'))
+    pv = tl.load(data_ptr + partner, mask=po, other=float('inf'))
+    sw = tl.where(asc, v > pv, v < pv) & c & io & po
+    tl.store(data_ptr + idx, tl.where(sw, pv, v), mask=io & c)
+    tl.store(data_ptr + partner, tl.where(sw, v, pv), mask=po & c)
 
-    is_controller = idx < partner
-    in_bounds = idx < n_elements
-    partner_in_bounds = partner < n_elements
 
-    # Bitonic direction: ascending when the stage-size bit is 0
-    ascending = (idx & stage_size) == 0
-
-    # Load both elements
-    val = tl.load(data_ptr + idx, mask=in_bounds)
-    partner_val = tl.load(data_ptr + partner, mask=partner_in_bounds)
-
-    # Swap condition — inf participates for correct non-power-of-2 sort
-    swap_needed = tl.where(ascending, val > partner_val, val < partner_val)
-    do_swap = swap_needed & is_controller & in_bounds & partner_in_bounds
-
-    # Controller writes to both positions
-    tl.store(
-        data_ptr + idx,
-        tl.where(do_swap, partner_val, val),
-        mask=in_bounds & is_controller,
-    )
-    tl.store(
-        data_ptr + partner,
-        tl.where(do_swap, val, partner_val),
-        mask=partner_in_bounds & is_controller,
-    )
+@triton.jit
+def bitonic_intrablock_kernel(
+    data_ptr,
+    n_elements,
+    stage_size,
+    first_stride,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Intra-block merge. Runs all strides from first_stride down to 1
+    in a single launch, with tl.debug_barrier between strides.
+    """
+    pid = tl.program_id(0)
+    tid = tl.arange(0, BLOCK_SIZE)
+    st = first_stride
+    while st > 0:
+        idx = pid * BLOCK_SIZE + tid
+        partner = idx ^ st
+        c = idx < partner
+        io = idx < n_elements
+        po = partner < n_elements
+        asc = (idx & stage_size) == 0
+        v = tl.load(data_ptr + idx, mask=io, other=float('inf'))
+        pv = tl.load(data_ptr + partner, mask=po, other=float('inf'))
+        sw = tl.where(asc, v > pv, v < pv) & c & io & po
+        tl.store(data_ptr + idx, tl.where(sw, pv, v), mask=io & c)
+        tl.store(data_ptr + partner, tl.where(sw, v, pv), mask=po & c)
+        tl.debug_barrier()
+        st //= 2
 
 
 def custom_kernel(data: input_t) -> output_t:
     """
-    Sort a 1D float32 array using a Triton bitonic sort kernel.
+    Sort a 1D float32 array using Triton bitonic sort.
+
+    Inter-block strides (>= BLOCK_SIZE): one launch each.
+    Intra-block strides (< BLOCK_SIZE): one launch per stage with barriers.
     """
     data_tensor, output_tensor = data
     n = data_tensor.numel()
 
-    # Pad to next power of 2 for the bitonic network structure.
     padded_n = 1
     while padded_n < n:
         padded_n *= 2
 
-    # Allocate a padded buffer for the sort — the output tensor has
-    # exactly n elements, so inf sentinels need their own space.
     padded = torch.empty(padded_n, dtype=torch.float32, device=data_tensor.device)
     padded[:n] = data_tensor
     padded[n:] = float('inf')
 
     BLOCK_SIZE: int = 1024
-    grid_size = (padded_n + BLOCK_SIZE - 1) // BLOCK_SIZE
+    grid = (padded_n + BLOCK_SIZE - 1) // BLOCK_SIZE
 
-    # Full bitonic sort: stages k = 2, 4, 8, ..., padded_n
     stage_size = 2
     while stage_size <= padded_n:
         stride = stage_size // 2
-        while stride > 0:
-            bitonic_sort_kernel[(grid_size,)](
+        while stride >= BLOCK_SIZE:
+            bitonic_merge_stride[(grid,)](
                 padded, padded_n, stage_size, stride,
                 BLOCK_SIZE=BLOCK_SIZE,
             )
             stride //= 2
+        if stride > 0:
+            bitonic_intrablock_kernel[(grid,)](
+                padded, padded_n, stage_size, stride,
+                BLOCK_SIZE=BLOCK_SIZE,
+            )
         stage_size *= 2
 
-    # Copy sorted result back to output (excluding inf padding)
     output_tensor[:] = padded[:n]
     return output_tensor
