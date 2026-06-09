@@ -8,6 +8,12 @@ sort_cuda_source = """
 #include <cub/device/device_radix_sort.cuh>
 #include <cstdint>
 
+// Persistent temp storage: allocated once, reused across all sort_cuda calls.
+// Sorted output is written to the user-supplied output tensor, not the temp
+// buffer, so the temp storage is safe to reuse without per-call allocation.
+static void* g_temp_storage = nullptr;
+static size_t g_temp_storage_bytes = 0;
+
 torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output) {
     TORCH_CHECK(input.device().is_cuda(), "Input must be a CUDA tensor");
     TORCH_CHECK(output.device().is_cuda(), "Output must be a CUDA tensor");
@@ -19,24 +25,28 @@ torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output) {
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
     // Step 1: query temp storage size
-    size_t temp_storage_bytes = 0;
+    size_t required_bytes = 0;
     cub::DeviceRadixSort::SortKeys(
-        nullptr, temp_storage_bytes,
+        nullptr, required_bytes,
         static_cast<const float*>(input.const_data_ptr<float>()),
         static_cast<float*>(output.data_ptr<float>()),
         num_items,
         0, sizeof(float) * 8,
         stream);
 
-    // Step 2: allocate temp storage
-    auto temp_storage = torch::empty(
-        {static_cast<int64_t>(temp_storage_bytes)},
-        torch::TensorOptions().dtype(torch::kUInt8).device(input.device()));
+    // Step 2: allocate or grow persistent temp storage (first call or larger input)
+    if (required_bytes > g_temp_storage_bytes) {
+        if (g_temp_storage) {
+            cudaFree(g_temp_storage);
+        }
+        cudaMalloc(&g_temp_storage, required_bytes);
+        g_temp_storage_bytes = required_bytes;
+    }
 
-    // Step 3: run the sort
+    // Step 3: run the sort using persistent temp storage
     cub::DeviceRadixSort::SortKeys(
-        temp_storage.data_ptr(),
-        temp_storage_bytes,
+        g_temp_storage,
+        required_bytes,
         static_cast<const float*>(input.const_data_ptr<float>()),
         static_cast<float*>(output.data_ptr<float>()),
         num_items,
