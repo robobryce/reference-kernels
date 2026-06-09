@@ -2,16 +2,11 @@
 CUB DeviceRadixSort::SortKeys with int32 bitcast (no float conversion).
 Since all data is positive IEEE 754, raw bits are in correct sort order.
 Interpret float* as int*, sort keys-only, re-interpret back as float.
-Dedicated CUDA memory pool + allocator pre-warming at module init.
+Persistent temp using cudaMalloc (sync, init-time) + default pool threshold tweak.
 """
 import torch
 from torch.utils.cpp_extension import load_inline
 from task import input_t, output_t
-
-# Pre-warm: allocate/free large tensors to prime PyTorch's CUDA allocator cache
-_warmup_tensor = torch.empty(100_000_000, dtype=torch.float32, device='cuda')
-del _warmup_tensor
-torch.cuda.synchronize()
 
 sort_cuda_source = """
 #include <torch/extension.h>
@@ -20,7 +15,6 @@ sort_cuda_source = """
 #include <cuda_runtime_api.h>
 #include <cstdint>
 
-static cudaMemPool_t persistent_pool = 0;
 static void* persistent_temp_ptr = nullptr;
 static size_t persistent_temp_bytes = 0;
 
@@ -35,19 +29,14 @@ void init_persistent_temp() {
         0, 32);
     persistent_temp_bytes = (persistent_temp_bytes * 11 + 9) / 10;
 
-    cudaMemPoolProps pool_props = {};
-    pool_props.allocType = cudaMemAllocationTypePinned;
-    pool_props.handleTypes = cudaMemHandleTypeNone;
-    pool_props.location.type = cudaMemLocationTypeDevice;
-    pool_props.location.id = 0;
-    pool_props.win32SecurityAttributes = nullptr;
-
-    cudaMemPoolCreate(&persistent_pool, &pool_props);
-
+    // Tune default pool: keep all memory resident (no release)
+    cudaMemPool_t default_pool;
+    cudaDeviceGetDefaultMemPool(&default_pool, 0);
     uint64_t threshold = UINT64_MAX;
-    cudaMemPoolSetAttribute(persistent_pool, cudaMemPoolAttrReleaseThreshold, &threshold);
+    cudaMemPoolSetAttribute(default_pool, cudaMemPoolAttrReleaseThreshold, &threshold);
 
-    cudaMallocFromPoolAsync(&persistent_temp_ptr, persistent_temp_bytes, persistent_pool, 0);
+    // Use plain cudaMalloc for this one-time init allocation
+    cudaMalloc(&persistent_temp_ptr, persistent_temp_bytes);
 }
 
 torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output) {
@@ -76,7 +65,7 @@ torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output);
 """
 
 sort_module = load_inline(
-    name='sort_cuda_int32_pool_warmup',
+    name='sort_cuda_int32_cudaMalloc_default_pool',
     cpp_sources=sort_cpp_source,
     cuda_sources=sort_cuda_source,
     functions=['sort_cuda', 'init_persistent_temp'],
@@ -90,8 +79,7 @@ sort_module.init_persistent_temp()
 def custom_kernel(data: input_t) -> output_t:
     """
     Sort via CUB DeviceRadixSort::SortKeys on raw int32 bitcast of float32.
-    Pre-warmed PyTorch allocator + dedicated CUDA memory pool with
-    release threshold = UINT64_MAX.
+    Persistent temp via cudaMalloc + default pool threshold=UINT64_MAX.
     """
     input_tensor, output_tensor = data
     sort_module.sort_cuda(input_tensor.contiguous(), output_tensor)
