@@ -1,10 +1,9 @@
 """
-CUB DeviceRadixSort::SortPairs with uint8 dummy values.
-Uses SortPairs (separate in/out buffers) to get the SortPairs kernel dispatch,
-which may use a different code path than SortKeys on sm_100.
-uint8 values add only N bytes overhead vs N*4 for int values.
-Keys: int32 bitcast of float32 (all positive, no conversion needed).
-Persistent temp storage allocated once at module init.
+CUB DeviceRadixSort::SortPairs with DoubleBuffer API (is_overwrite_okay=true).
+Uses ~N temp storage instead of ~2N. Input/output tensors are used directly
+as DoubleBuffer slots to avoid extra copies.
+Keys: int32 bitcast of float32. Values: uint8 dummy (minimal O(N) overhead).
+Persistent buffers allocated once at module init.
 """
 import torch
 from torch.utils.cpp_extension import load_inline
@@ -16,35 +15,37 @@ sort_cuda_source = """
 #include <cub/device/device_radix_sort.cuh>
 #include <cstdint>
 
-static torch::Tensor persistent_temp;
-static torch::Tensor persistent_vals_in;
-static torch::Tensor persistent_vals_out;
+static torch::Tensor persistent_temp = {};
+static torch::Tensor persistent_val_buf1 = {};
+static torch::Tensor persistent_val_buf2 = {};
 static size_t persistent_temp_bytes = 0;
 
 void init_persistent_temp() {
     if (persistent_temp.defined()) return;
     int64_t max_n = 100'000'000;
 
-    // Query temp storage for SortPairs with int32 keys and uint8 values
+    persistent_val_buf1 = torch::empty(
+        {max_n}, torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA));
+    persistent_val_buf2 = torch::empty(
+        {max_n}, torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA));
+
+    cub::DoubleBuffer<uint8_t> d_values(
+        persistent_val_buf1.data_ptr<uint8_t>(),
+        persistent_val_buf2.data_ptr<uint8_t>());
+
+    // Use nullptr for keys (will query with real buffers at call time)
     cub::DeviceRadixSort::SortPairs(
         nullptr, persistent_temp_bytes,
-        static_cast<const int32_t*>(nullptr),
         static_cast<int32_t*>(nullptr),
-        static_cast<const uint8_t*>(nullptr),
+        static_cast<int32_t*>(nullptr),
+        static_cast<uint8_t*>(nullptr),
         static_cast<uint8_t*>(nullptr),
         static_cast<int64_t>(max_n),
         0, 32);
+
     persistent_temp_bytes = (persistent_temp_bytes * 11 + 9) / 10;
     persistent_temp = torch::empty(
         {static_cast<int64_t>(persistent_temp_bytes)},
-        torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA));
-
-    // Pre-allocate dummy value buffers (uint8 = 1 byte per element)
-    persistent_vals_in = torch::empty(
-        {max_n},
-        torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA));
-    persistent_vals_out = torch::empty(
-        {max_n},
         torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA));
 }
 
@@ -52,18 +53,36 @@ torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output) {
     auto num_items = static_cast<int64_t>(input.numel());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
-    const int32_t* key_in = reinterpret_cast<const int32_t*>(input.const_data_ptr<float>());
-    int32_t* key_out = reinterpret_cast<int32_t*>(output.data_ptr<float>());
+    // Use input and output tensors as DoubleBuffer slots for keys
+    // input = current (has data), output = alternate (temp/result destination)
+    cub::DoubleBuffer<int32_t> d_keys(
+        const_cast<int32_t*>(reinterpret_cast<const int32_t*>(input.const_data_ptr<float>())),
+        reinterpret_cast<int32_t*>(output.data_ptr<float>()));
+
+    cub::DoubleBuffer<uint8_t> d_values(
+        persistent_val_buf1.data_ptr<uint8_t>(),
+        persistent_val_buf2.data_ptr<uint8_t>());
 
     size_t temp_bytes = persistent_temp_bytes;
     cub::DeviceRadixSort::SortPairs(
         persistent_temp.data_ptr(), temp_bytes,
-        key_in, key_out,
-        persistent_vals_in.data_ptr<uint8_t>(),
-        persistent_vals_out.data_ptr<uint8_t>(),
+        d_keys, d_values,
         num_items,
         0, 32,
         stream);
+
+    // d_keys.Current() now points to the sorted result — copy if needed
+    if (d_keys.Current() == reinterpret_cast<int32_t*>(output.data_ptr<float>())) {
+        // Result already in output buffer — nothing to do
+    } else {
+        // Result still in input buffer — copy to output
+        cudaMemcpyAsync(
+            output.data_ptr<float>(),
+            input.const_data_ptr<float>(),
+            num_items * sizeof(float),
+            cudaMemcpyDeviceToDevice,
+            stream);
+    }
 
     return output;
 }
@@ -77,7 +96,7 @@ torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output);
 """
 
 sort_module = load_inline(
-    name='sort_cuda_sortpairs_uint8',
+    name='sort_cuda_sortpairs_doublebuf_v2',
     cpp_sources=sort_cpp_source,
     cuda_sources=sort_cuda_source,
     functions=['sort_cuda', 'init_persistent_temp'],
@@ -90,10 +109,9 @@ sort_module.init_persistent_temp()
 
 def custom_kernel(data: input_t) -> output_t:
     """
-    Sort via CUB DeviceRadixSort::SortPairs on raw int32 bitcast of float32,
-    with uint8 dummy values to trigger SortPairs dispatch path.
-    No float conversion needed — all data is positive IEEE 754 floats.
-    Persistent temp storage avoids per-call allocation.
+    Sort via CUB DeviceRadixSort::SortPairs DoubleBuffer API.
+    Input/output tensors used directly as DoubleBuffer slots.
+    Persistent temp + value buffers at module init.
     """
     input_tensor, output_tensor = data
     sort_module.sort_cuda(input_tensor.contiguous(), output_tensor)
