@@ -1,7 +1,9 @@
 """
-CUB DeviceRadixSort::SortKeys with native float32 key type.
-Letting CUB handle float→uint bit flip internally via FLOAT_KEYS=1 in Policy900.
-This may dispatch differently than our manual int32_t reinterpret_cast.
+CUB DeviceRadixSort::SortKeys compiled with explicit sm_100 architecture flag
+via extra_cuda_cflags. Force nvcc to target compute_100,code=sm_100 to ensure
+CUB sees the correct PTX architecture for B200 Blackwell.
+Previous recompilations produced 273-307us vs parent's 176us — possibly
+because torch's default arch list excludes compute_100 and targets sm_90.
 """
 import torch
 from torch.utils.cpp_extension import load_inline
@@ -21,9 +23,9 @@ void init_persistent_temp() {
     int64_t max_n = 100'000'000;
     cub::DeviceRadixSort::SortKeys(
         nullptr, persistent_temp_bytes,
-        static_cast<const float*>(nullptr),
-        static_cast<float*>(nullptr),
-        max_n,
+        static_cast<const int32_t*>(nullptr),
+        static_cast<int32_t*>(nullptr),
+        static_cast<int64_t>(max_n),
         0, 32);
     persistent_temp_bytes = (persistent_temp_bytes * 11 + 9) / 10;
     persistent_temp = torch::empty(
@@ -35,11 +37,13 @@ torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output) {
     auto num_items = static_cast<int64_t>(input.numel());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
+    const int32_t* key_in = reinterpret_cast<const int32_t*>(input.const_data_ptr<float>());
+    int32_t* key_out = reinterpret_cast<int32_t*>(output.data_ptr<float>());
+
     size_t temp_bytes = persistent_temp_bytes;
     cub::DeviceRadixSort::SortKeys(
         persistent_temp.data_ptr(), temp_bytes,
-        input.const_data_ptr<float>(), output.data_ptr<float>(),
-        num_items,
+        key_in, key_out, num_items,
         0, 32,
         stream);
 
@@ -55,12 +59,13 @@ torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output);
 """
 
 sort_module = load_inline(
-    name='sort_cuda_float_native',
+    name='sort_cuda_sm100_explicit',
     cpp_sources=sort_cpp_source,
     cuda_sources=sort_cuda_source,
     functions=['sort_cuda', 'init_persistent_temp'],
     extra_include_paths=['/usr/local/cuda-12.8/targets/x86_64-linux/include'],
-    verbose=False,
+    extra_cuda_cflags=['-arch=sm_100', '-gencode=arch=compute_100,code=sm_100'],
+    verbose=True,
 )
 
 sort_module.init_persistent_temp()
@@ -68,8 +73,8 @@ sort_module.init_persistent_temp()
 
 def custom_kernel(data: input_t) -> output_t:
     """
-    Sort via CUB DeviceRadixSort::SortKeys with native float32 keys.
-    CUB internally converts float to unsigned sort keys.
+    Sort via CUB DeviceRadixSort::SortKeys compiled with -arch=sm_100.
+    Forces nvcc to target compute_100 PTX, ensuring CUB uses correct policy.
     """
     input_tensor, output_tensor = data
     sort_module.sort_cuda(input_tensor.contiguous(), output_tensor)
