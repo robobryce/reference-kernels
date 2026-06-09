@@ -1,8 +1,10 @@
 """
-CUB DeviceRadixSort::SortKeys with int32_t bitcast.
-Uses sm_100a arch target + int32_t offsets for Blackwell optimization.
-This matches the parent c9b9338b approach exactly with the two
-optimizations from other workers (sm_100a from worker 2, int32_t from worker 1).
+CUB DeviceRadixSort::SortKeys with int32_t bitcast + end_bit=31.
+All positive IEEE 754 float32 values have bit 31 = 0 in int32 bitcast.
+end_bit=31 skips the always-zero sign bit — still 4 radix passes
+(same as end_bit=32 for 8-bit Onesweep radix groups), but CUB
+may dispatch differently for the non-32 exact bit range.
+Uses int32_t offsets and sm_100a arch.
 """
 import torch
 from torch.utils.cpp_extension import load_inline
@@ -25,7 +27,7 @@ void init_persistent_temp() {
         static_cast<const int32_t*>(nullptr),
         static_cast<int32_t*>(nullptr),
         static_cast<int32_t>(max_n),
-        0, 32);
+        0, 31);
     persistent_temp_bytes = (persistent_temp_bytes * 11 + 9) / 10;
     persistent_temp = torch::empty(
         {static_cast<int64_t>(persistent_temp_bytes)},
@@ -43,7 +45,7 @@ torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output) {
     cub::DeviceRadixSort::SortKeys(
         persistent_temp.data_ptr(), temp_bytes,
         key_in, key_out, num_items,
-        0, 32,
+        0, 31,
         stream);
 
     return output;
@@ -58,7 +60,7 @@ torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output);
 """
 
 sort_module = load_inline(
-    name='sort_cuda_int32_sm100a',
+    name='sort_cuda_int32_endbit31_sm100a',
     cpp_sources=sort_cpp_source,
     cuda_sources=sort_cuda_source,
     functions=['sort_cuda', 'init_persistent_temp'],
@@ -71,8 +73,7 @@ sort_module.init_persistent_temp()
 
 def custom_kernel(data: input_t) -> output_t:
     """
-    Sort via CUB DeviceRadixSort::SortKeys on int32_t bitcast.
-    sm_100a arch + int32_t offsets for Blackwell.
+    Sort via CUB DeviceRadixSort::SortKeys, end_bit=31.
     """
     input_tensor, output_tensor = data
     sort_module.sort_cuda(input_tensor.contiguous(), output_tensor)
