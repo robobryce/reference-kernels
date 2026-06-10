@@ -56,7 +56,7 @@ def _cu():
         st=so+'.tmp'
         with open(cu,'w') as f:f.write(s)
         ch=os.environ.get('CUDA_HOME','/usr/local/cuda')
-        sp.run(['nvcc','-shared','-O3','-Xcompiler','-fPIC','-arch=sm_100',
+        sp.run(['nvcc','-shared','-O3','-Xcompiler','-fPIC','-arch=sm_100a',
                 f'-I{ch}/include','-o',st,cu,'-lcudart'],
                 check=True,capture_output=True,text=True,timeout=120)
         os.rename(st,so)
