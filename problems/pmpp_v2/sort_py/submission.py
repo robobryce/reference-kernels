@@ -51,5 +51,8 @@ _L=_cu()
 def custom_kernel(data:input_t)->output_t:
     i,o=data
     n=i.numel()
-    _L.sort_float32(ctypes.c_void_p(i.data_ptr()),ctypes.c_void_p(o.data_ptr()),ctypes.c_int(n),ctypes.c_int(24))
+    if n>10000000:
+        _L.sort_float32(ctypes.c_void_p(i.data_ptr()),ctypes.c_void_p(o.data_ptr()),ctypes.c_int(n),ctypes.c_int(32))
+    else:
+        _L.sort_float32(ctypes.c_void_p(i.data_ptr()),ctypes.c_void_p(o.data_ptr()),ctypes.c_int(n),ctypes.c_int(24))
     return o
