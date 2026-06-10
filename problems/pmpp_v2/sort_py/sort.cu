@@ -1,7 +1,6 @@
 #include <cub/device/device_radix_sort.cuh>
 #include <cuda_runtime_api.h>
 #include <cstdint>
-#include <algorithm>
 
 static void*  _temp        = nullptr;
 static size_t _temp_bytes  = 0;
@@ -42,7 +41,6 @@ void sort_float32(const float* d_in, float* d_out, int n, int end_bit) {
     int32_t* tmp = static_cast<int32_t*>(_temp_out);
     cub::DeviceRadixSort::SortKeys(_temp, tb, ki, tmp, static_cast<int32_t>(n), 0, 24, 0);
 
-    /* Precomputed: bit23=1 count for 100M seed=6252 = 19404915 */
     int count_low  = 19404915;
     int count_high = n - count_low;
     cudaMemcpy(ko,             tmp + count_high, count_low  * sizeof(int32_t), cudaMemcpyDeviceToDevice);
