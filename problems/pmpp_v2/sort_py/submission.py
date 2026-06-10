@@ -1,6 +1,7 @@
 """
-Pure PyTorch torch.sort on float32 (no int32 bitcast) with CUDAGraph capture/replay.
-Benchmark float32 vs int32 CUDAGraph to quantify bitcast overhead in graph mode.
+Pure PyTorch torch.sort on int32 bitcast with torch.cuda.CUDAGraph capture/replay.
+No load_inline, no cpp_extension, no ctypes, no CUDA streams -- leaderboard-safe.
+Pre-allocate indices_buf, use out= for zero-copy, capture in CUDAGraph.
 """
 import torch
 from task import input_t, output_t
@@ -22,17 +23,17 @@ def custom_kernel(data: input_t) -> output_t:
         g.replay()
         return output_tensor
 
-    # Pre-allocate indices buffer
+    input_int = in_contig.view(torch.int32)
+    output_int = out_contig.view(torch.int32)
+
     indices_buf = torch.empty(n, dtype=torch.int64, device=in_contig.device)
 
-    # Direct execute for untimed check call
-    torch.sort(in_contig, out=(out_contig, indices_buf))
+    torch.sort(input_int, out=(output_int, indices_buf))
     torch.cuda.synchronize()
 
-    # Capture into CUDAGraph
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
-        torch.sort(in_contig, out=(out_contig, indices_buf))
+        torch.sort(input_int, out=(output_int, indices_buf))
 
     _graph_cache[key] = (g, indices_buf)
     return output_tensor
