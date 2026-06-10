@@ -58,7 +58,7 @@ torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output);
 """
 
 sort_module = load_inline(
-    name='sort_cuda_int32_t_nosm100a',
+    name='sort_cuda_int32_t_ptcub',
     cpp_sources=sort_cpp_source,
     cuda_sources=sort_cuda_source,
     functions=['sort_cuda', 'init_persistent_temp'],
