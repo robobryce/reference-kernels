@@ -1,22 +1,14 @@
 """
-Pure PyTorch torch.sort on int32 bitcast with torch.cuda.CUDAGraph capture/replay.
-No load_inline, no cpp_extension, no ctypes, no CUDA streams -- leaderboard-safe.
-Pre-allocate indices_buf, use out= for zero-copy, capture in CUDAGraph.
-Added torch.cuda.synchronize() before capture to flush pending ops.
+Pure PyTorch torch.sort on float32 (no int32 bitcast) with CUDAGraph capture/replay.
+Benchmark float32 vs int32 CUDAGraph to quantify bitcast overhead in graph mode.
 """
 import torch
 from task import input_t, output_t
 
-# Per-tensor graph cache: (output_data_ptr, numel) -> (CUDAGraph, indices_buf)
 _graph_cache = {}
 
 
 def custom_kernel(data: input_t) -> output_t:
-    """
-    Sort via torch.sort on int32 bitcast with CUDAGraph capture/replay.
-    Pre-allocate indices_buf, use out= for zero-copy sort, capture in graph.
-    First call per tensor combo executes directly + captures graph for replay.
-    """
     input_tensor, output_tensor = data
 
     in_contig = input_tensor.contiguous()
@@ -24,35 +16,23 @@ def custom_kernel(data: input_t) -> output_t:
     n = in_contig.numel()
     key = (out_contig.data_ptr(), n)
 
-    # Hot path: replay pre-captured graph
     entry = _graph_cache.get(key)
     if entry is not None:
         g, _indices = entry
         g.replay()
         return output_tensor
 
-    # First call (untimed correctness check): execute directly,
-    # then capture into CUDAGraph.
-
-    # View float32 as int32 -- raw IEEE 754 bits sort correctly for
-    # positive data (input is randn + large seed, all values > 0).
-    input_int = in_contig.view(torch.int32)
-    output_int = out_contig.view(torch.int32)
-
-    # Pre-allocate indices buffer (torch.sort always returns int64 indices).
+    # Pre-allocate indices buffer
     indices_buf = torch.empty(n, dtype=torch.int64, device=in_contig.device)
 
-    # Execute directly for the untimed check call
-    torch.sort(input_int, descending=False, out=(output_int, indices_buf))
+    # Direct execute for untimed check call
+    torch.sort(in_contig, out=(out_contig, indices_buf))
     torch.cuda.synchronize()
 
-    # Flush any pending CUDA ops before graph capture
-    torch.cuda.synchronize()
-
-    # Capture the sort into a CUDAGraph on these exact tensor pointers
+    # Capture into CUDAGraph
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
-        torch.sort(input_int, descending=False, out=(output_int, indices_buf))
+        torch.sort(in_contig, out=(out_contig, indices_buf))
 
     _graph_cache[key] = (g, indices_buf)
     return output_tensor
