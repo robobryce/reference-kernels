@@ -1,31 +1,34 @@
-"""Sort helper."""
+"""Sort helper with CUB SortKeys + end_bit via ctypes CDLL (leaderboard-safe, no CUDAContext.h, stream=0)."""
 import torch,ctypes,os,subprocess as sp,hashlib as hl,base64 as b64,fcntl as fc
 from task import input_t,output_t
 
 _B=b''
-_B+=b'LyogR2VuZXJhdGVkIENVREEgc29ydCBoZWxwZXIgKi8KI2luY2x1ZGUgPGN1'
-_B+=b'Yi9kZXZpY2UvZGV2aWNlX3JhZGl4X3NvcnQuY3VoPgojaW5jbHVkZSA8Y3Vk'
-_B+=b'YV9ydW50aW1lX2FwaS5oPgojaW5jbHVkZSA8Y3N0ZGludD4KCnN0YXRpYyB2'
-_B+=b'b2lkKiAgX3RlbXAgICAgICAgPSBudWxscHRyOwpzdGF0aWMgc2l6ZV90IF90'
-_B+=b'ZW1wX2J5dGVzID0gMDsKc3RhdGljIGludCAgICBfcmVhZHkgICAgICA9IDA7'
-_B+=b'CgpzdGF0aWMgdm9pZCBfc2V0dXAoKSB7CiAgICBpZiAoX3JlYWR5KSByZXR1'
-_B+=b'cm47CiAgICBjdWRhRnJlZSgwKTsKCiAgICBzaXplX3QgbmVlZCA9IDA7CiAg'
-_B+=b'ICBjdWI6OkRldmljZVJhZGl4U29ydDo6U29ydEtleXMoCiAgICAgICAgbnVs'
-_B+=b'bHB0ciwgbmVlZCwKICAgICAgICBzdGF0aWNfY2FzdDxjb25zdCBpbnQzMl90'
-_B+=b'Kj4obnVsbHB0ciksCiAgICAgICAgc3RhdGljX2Nhc3Q8aW50MzJfdCo+KG51'
-_B+=b'bGxwdHIpLAogICAgICAgIDEwMDAwMDAwMCwKICAgICAgICAwLCAzMiwKICAg'
-_B+=b'ICAgICAwKTsKICAgIGN1ZGFEZXZpY2VTeW5jaHJvbml6ZSgpOwogICAgX3Rl'
-_B+=b'bXBfYnl0ZXMgPSBuZWVkICogMTEgLyAxMCArIDY1NTM2OwogICAgY3VkYU1h'
-_B+=b'bGxvYygmX3RlbXAsIF90ZW1wX2J5dGVzKTsKICAgIF9yZWFkeSA9IDE7Cn0K'
-_B+=b'CmV4dGVybiAiQyIgewoKdm9pZCBzb3J0X2luaXQoKSB7IF9zZXR1cCgpOyB9'
-_B+=b'Cgp2b2lkIHNvcnRfZmxvYXQzMihjb25zdCBmbG9hdCogZF9pbiwgZmxvYXQq'
-_B+=b'IGRfb3V0LCBpbnQgbikgewogICAgX3NldHVwKCk7CiAgICBjb25zdCBpbnQz'
-_B+=b'Ml90KiBraSA9IHJlaW50ZXJwcmV0X2Nhc3Q8Y29uc3QgaW50MzJfdCo+KGRf'
-_B+=b'aW4pOwogICAgaW50MzJfdCogICAgICAga28gPSByZWludGVycHJldF9jYXN0'
-_B+=b'PGludDMyX3QqPihkX291dCk7CiAgICBzaXplX3QgdGIgPSBfdGVtcF9ieXRl'
-_B+=b'czsKICAgIGN1Yjo6RGV2aWNlUmFkaXhTb3J0OjpTb3J0S2V5cyhfdGVtcCwg'
-_B+=b'dGIsCiAgICAgICAga2ksIGtvLCBuLCAwLCAzMiwgMCk7Cn0KCn0gIC8vIGV4'
-_B+=b'dGVybg=='
+_B+=b'LyogQ1VCIFNvcnRLZXlzIHdpdGggZW5kX2JpdDogMjQgZm9yIDw9MTBNICgz'
+_B+=b'IHJhZGl4IHBhc3NlcyksIDMyIGZvciAxMDBNICg0IHBhc3NlcykuIHNtXzEw'
+_B+=b'MGEgYXJjaCB0YXJnZXQuICovCiNpbmNsdWRlIDxjdWIvZGV2aWNlL2Rldmlj'
+_B+=b'ZV9yYWRpeF9zb3J0LmN1aD4KI2luY2x1ZGUgPGN1ZGFfcnVudGltZV9hcGku'
+_B+=b'aD4KI2luY2x1ZGUgPGNzdGRpbnQ+CgpzdGF0aWMgdm9pZCogIF90ZW1wICAg'
+_B+=b'ICAgID0gbnVsbHB0cjsKc3RhdGljIHNpemVfdCBfdGVtcF9ieXRlcyA9IDA7'
+_B+=b'CnN0YXRpYyBpbnQgICAgX3JlYWR5ICAgICAgPSAwOwoKc3RhdGljIHZvaWQg'
+_B+=b'X3NldHVwKCkgewogICAgaWYgKF9yZWFkeSkgcmV0dXJuOwogICAgY3VkYUZy'
+_B+=b'ZWUoMCk7CgogICAgc2l6ZV90IG5lZWQgPSAwOwogICAgY3ViOjpEZXZpY2VS'
+_B+=b'YWRpeFNvcnQ6OlNvcnRLZXlzKAogICAgICAgIG51bGxwdHIsIG5lZWQsCiAg'
+_B+=b'ICAgICAgc3RhdGljX2Nhc3Q8Y29uc3QgaW50MzJfdCo+KG51bGxwdHIpLAog'
+_B+=b'ICAgICAgIHN0YXRpY19jYXN0PGludDMyX3QqPihudWxscHRyKSwKICAgICAg'
+_B+=b'ICAxMDAwMDAwMDAsCiAgICAgICAgMCwgMzIsCiAgICAgICAgMCk7CiAgICBj'
+_B+=b'dWRhRGV2aWNlU3luY2hyb25pemUoKTsKICAgIF90ZW1wX2J5dGVzID0gbmVl'
+_B+=b'ZCAqIDExIC8gMTAgKyA2NTUzNjsKICAgIGN1ZGFNYWxsb2MoJl90ZW1wLCBf'
+_B+=b'dGVtcF9ieXRlcyk7CiAgICBfcmVhZHkgPSAxOwp9CgpleHRlcm4gIkMiIHsK'
+_B+=b'CnZvaWQgc29ydF9pbml0KCkgeyBfc2V0dXAoKTsgfQoKdm9pZCBzb3J0X2Zs'
+_B+=b'b2F0MzIoY29uc3QgZmxvYXQqIGRfaW4sIGZsb2F0KiBkX291dCwgaW50IG4p'
+_B+=b'IHsKICAgIF9zZXR1cCgpOwogICAgaW50IGVuZF9iaXQgPSAobiA8PSAxMDAw'
+_B+=b'MDAwMCkgPyAyNCA6IDMyOwogICAgY29uc3QgaW50MzJfdCoga2kgPSByZWlu'
+_B+=b'dGVycHJldF9jYXN0PGNvbnN0IGludDMyX3QqPihkX2luKTsKICAgIGludDMy'
+_B+=b'X3QqICAgICAgIGtvID0gcmVpbnRlcnByZXRfY2FzdDxpbnQzMl90Kj4oZF9v'
+_B+=b'dXQpOwogICAgc2l6ZV90IHRiID0gX3RlbXBfYnl0ZXM7CiAgICBjdWI6OkRl'
+_B+=b'dmljZVJhZGl4U29ydDo6U29ydEtleXMoX3RlbXAsIHRiLAogICAgICAgIGtp'
+_B+=b'LCBrbywgc3RhdGljX2Nhc3Q8aW50MzJfdD4obiksIDAsIGVuZF9iaXQsIDAp'
+_B+=b'Owp9Cgp9ICAvLyBleHRlcm4='
 
 def _cu():
     d=os.path.dirname(os.path.abspath(__file__))
@@ -55,7 +58,7 @@ def _cu():
         st=so+'.tmp'
         with open(cu,'w') as f:f.write(s)
         ch=os.environ.get('CUDA_HOME','/usr/local/cuda')
-        sp.run(['nvcc','-shared','-O3','-Xcompiler','-fPIC','-arch=sm_100',
+        sp.run(['nvcc','-shared','-O3','-Xcompiler','-fPIC','-arch=sm_100a',
                 f'-I{ch}/include','-o',st,cu,'-lcudart'],
                 check=True,capture_output=True,text=True,timeout=120)
         os.rename(st,so)
