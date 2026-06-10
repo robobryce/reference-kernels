@@ -24,9 +24,11 @@ int sort_float32_init() {
     return (err == cudaSuccess) ? 0 : 1;
 }
 
-int sort_float32(float* d_in, float* d_out, int n) {
+int sort_float32(float* d_in, float* d_out, int n, void* stream_ptr) {
     int ret = sort_float32_init();
     if (ret != 0) return ret;
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
 
     const int32_t* key_in = reinterpret_cast<const int32_t*>(d_in);
     int32_t* key_out = reinterpret_cast<int32_t*>(d_out);
@@ -35,9 +37,10 @@ int sort_float32(float* d_in, float* d_out, int n) {
     cudaError_t err = cub::DeviceRadixSort::SortKeys(
         d_temp_storage, tmp,
         key_in, key_out, static_cast<int64_t>(n),
-        0, 32);
+        0, 32,
+        stream);
 
-    return (err == cudaSuccess) ? 0 : 1;
+    return (err == cudaSuccess) ? 0 : 3;
 }
 
 void sort_float32_cleanup() {
